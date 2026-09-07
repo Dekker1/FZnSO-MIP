@@ -1,0 +1,20 @@
+% Each column of the row-major array is lexicographically below the next.
+%
+% See `mip_lex.mzn`.
+
+include "mip_lex.mzn";
+
+predicate fzn_bool_lex_chain_less(list of var bool: xs, int: columns) =
+  if columns < 2 then
+    true
+  else
+    let {
+      int: rows = length(xs) div columns;
+    } in forall (j in 1..columns - 1) (
+      mip_bool_lex(
+        [xs[(i - 1) * columns + j] | i in 1..rows],
+        [xs[(i - 1) * columns + j + 1] | i in 1..rows],
+        true,
+      )
+    )
+  endif;
