@@ -75,8 +75,55 @@ flattener's include path. See `mznlib/README.md` for where the line is drawn and
 `cargo run -p fznso-conform -- check build/lib/fznso/Debug/libhighs.dylib`
 checks it against the registry.
 
-## Not incremental
+## Incremental runs
 
-Every `run` rebuilds the model from scratch and ignores `layer_unchanged`.
-Always correct, just not incremental; `MipBackend::reset` is where a backend
-that could reuse its matrix would hook in.
+An instance is run any number of times, and two things carry between runs.
+
+**The model.** `layer_unchanged()` says how many layers are exactly as the
+solver last saw them, and index order follows layer order, so what a retracted
+layer took with it is always a *suffix* of the columns and rows. A run therefore
+truncates the backend to the last unchanged layer's end and posts only what lies
+above it. `MipSolver` records each layer's column and row count as it builds, so
+it knows where to cut; `MipBackend::truncate` does the cutting, and a backend
+opts in through `Capabilities::incremental`.
+
+Three things send it back to a full rebuild, because none can be done by adding
+to what is already there:
+
+- the objective changed — a cost is a column property, fixed when the column was
+  handed over;
+- a new layer's `bool_to_int` or `int_to_float` joins two decisions that already
+  own a column apiece, which would mean merging two columns the backend has;
+- a new layer narrows a column handed over on an earlier run.
+
+Worth what the build costs and no more, which is proportional to the model and
+independent of the search: on a 40,000-row model a re-solve spends 0.004s
+building instead of 0.265s, and on `unit/regression/pred_param_r7550.mzn` — 6,310
+rows against a 32-second search — it saves 0.05s of 32s.
+
+**The last solution.** Whatever the previous run ended with is offered to the
+backend as a starting point for the next, over the decisions the two runs share
+— the same unchanged prefix, for the same reason. `warm_start(xs, vs)`
+annotations on the objective are read as the initial hint and a carried value
+overrides them, since an annotation is a guess made before anything was solved.
+
+A start is advice: `MipBackend::set_start` may be ignored, and HiGHS tolerates
+one that is infeasible. Which is just as well, because the commonest incremental
+pattern — solve, add a constraint cutting off what was just found, solve again —
+makes the carried solution infeasible by construction. No speedup from it has
+been measured; on knapsacks of 70 and 260 items, tightening and relaxing, warm
+and cold are within noise, because HiGHS's own root heuristics find an equally
+good incumbent in milliseconds.
+
+Two further ideas were investigated and are not implemented. A previous run's
+*dual* bound stays valid when layers are only pushed, since the feasible set only
+shrinks — but HiGHS has no MIP lower-bound input (`objective_bound` is
+dual-simplex termination, `objective_target` is a stop condition). And
+`Highs_getBasis`/`setBasis` cannot reach the MIP solver, which runs its own root
+LP.
+
+One thing the interface cannot carry: MiniZinc writes `warm_start_array([...])`
+and puts warm starts inside `seq_search`, but an annotation argument is a
+`FznsoValue` and no value kind is an annotation — so a grouped warm start is
+unrepresentable, and only a flat `warm_start` written directly on the solve item
+arrives here.

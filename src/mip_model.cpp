@@ -177,18 +177,55 @@ double MipModel::read_linear(const fznso::Value& coeffs, const fznso::Value& xs)
 	return constant;
 }
 
-std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
+const char* const MipModel::kNeedsFullBuild = "cannot extend this model in place";
+
+void MipModel::truncate(std::size_t decisions, std::size_t columns, std::size_t rows) {
+	column_.resize(decisions);
+	kind_.resize(decisions);
+	parent_.resize(decisions);
+	intervals_.resize(columns);
+	columns_ = columns;
+	rows_ = rows;
+}
+
+std::string MipModel::build(const fznso::Model& model, MipBackend& backend,
+                            std::size_t first_decision, std::size_t first_constraint,
+                            bool extending) {
 	const double inf = backend.infinity();
 	const std::size_t decisions = model.decision_count();
 	const std::size_t constraints = model.constraint_count();
 
-	parent_.resize(decisions);
-	for (std::size_t i = 0; i < decisions; i++) {
-		parent_[i] = i;
+	// Where this call's columns and rows start. On a fresh build both are zero
+	// and everything below reads as it always did.
+	const std::size_t base_column = extending ? columns_ : 0;
+
+	if (extending) {
+		if (first_decision > decisions || first_constraint > constraints ||
+		    first_decision > column_.size()) {
+			return kNeedsFullBuild;
+		}
+		parent_.resize(decisions);
+		for (std::size_t i = first_decision; i < decisions; i++) {
+			parent_[i] = i;
+		}
+		column_.resize(decisions, -1);
+		kind_.resize(decisions, ValueKind::Int);
+		handled_.assign(constraints, 0);
+		for (std::size_t c = 0; c < first_constraint; c++) {
+			handled_[c] = 1; // already posted, or already folded away
+		}
+	} else {
+		parent_.resize(decisions);
+		for (std::size_t i = 0; i < decisions; i++) {
+			parent_[i] = i;
+		}
+		column_.assign(decisions, -1);
+		kind_.assign(decisions, ValueKind::Int);
+		handled_.assign(constraints, 0);
+		intervals_.clear();
+		rows_ = 0;
+		columns_ = 0;
 	}
-	column_.assign(decisions, -1);
-	kind_.assign(decisions, ValueKind::Int);
-	handled_.assign(constraints, 0);
 
 	// --- pass 1: which decisions are the same column ------------------------
 	//
@@ -197,7 +234,7 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 	// equality row. Joining them here is what lets a `var bool` be the binary
 	// column a reified constraint's big-M term multiplies, instead of a Boolean
 	// channelled into a second column for presolve to remove again.
-	for (std::size_t c = 0; c < constraints; c++) {
+	for (std::size_t c = first_constraint; c < constraints; c++) {
 		std::string_view ident = dispatch_ident(model.constraint_ident(fznso::Constraint{c}));
 		if (ident != "bool_to_int" && ident != "int_to_float") {
 			continue;
@@ -208,7 +245,16 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 		fznso::Value a = model.constraint_argument(fznso::Constraint{c}, 0);
 		fznso::Value b = model.constraint_argument(fznso::Constraint{c}, 1);
 		if (a.kind() == FznsoValueDecision && b.kind() == FznsoValueDecision) {
-			unite(a.as_decision().index, b.as_decision().index);
+			std::size_t x = a.as_decision().index;
+			std::size_t y = b.as_decision().index;
+			// Joining two classes that already own a column apiece would mean
+			// merging two columns the backend has already been given, which
+			// nothing here can do. Rare, and starting over is always right.
+			if (extending && column_[find(x)] >= 0 && column_[find(y)] >= 0 &&
+			    find(x) != find(y)) {
+				return kNeedsFullBuild;
+			}
+			unite(x, y);
 			handled_[c] = 1;
 		}
 		// With a literal on either side there is nothing to join; pass 2 posts
@@ -225,7 +271,7 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 	ub.reserve(decisions);
 	kinds.reserve(decisions);
 
-	for (std::size_t d = 0; d < decisions; d++) {
+	for (std::size_t d = first_decision; d < decisions; d++) {
 		FznsoType type = model.decision_type(fznso::Decision{d});
 		if (type.set_of || type.list_of) {
 			return "decision " + std::to_string(d) + ": this solver has no set or list variables";
@@ -257,7 +303,7 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 
 		std::size_t root = find(d);
 		if (column_[root] < 0) {
-			column_[root] = static_cast<int>(obj.size());
+			column_[root] = static_cast<int>(base_column + obj.size());
 			obj.push_back(0.0);
 			lb.push_back(own.front().min);
 			ub.push_back(own.back().max);
@@ -267,21 +313,27 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 			kinds.push_back(kind_[d] == ValueKind::Float ? ColKind::Continuous : ColKind::Integer);
 		} else {
 			auto col = static_cast<std::size_t>(column_[root]);
+			// A column handed over on an earlier run cannot have its bounds
+			// narrowed now — the backend was given them once.
+			if (col < base_column) {
+				return kNeedsFullBuild;
+			}
 			intervals_[col] = intersect(intervals_[col], own);
-			lb[col] = intervals_[col].front().min;
-			ub[col] = intervals_[col].back().max;
+			lb[col - base_column] = intervals_[col].front().min;
+			ub[col - base_column] = intervals_[col].back().max;
 			if (kind_[d] != ValueKind::Float) {
-				kinds[col] = ColKind::Integer;
+				kinds[col - base_column] = ColKind::Integer;
 			}
 		}
 		column_[d] = column_[root];
 	}
 
-	rows_ = 0;
-
 	// --- the objective ------------------------------------------------------
 	//
-	// Set before the columns are handed over, since a cost is a column property.
+	// Set before the columns are handed over, since a cost is a column property
+	// — which is also why extending cannot change it: the column carrying the
+	// cost was handed over on an earlier run. The caller only extends when the
+	// objective is the one it built for.
 	std::string_view objective = model.objective_ident();
 	bool maximise = false;
 	if (!objective.empty()) {
@@ -294,7 +346,16 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 		}
 		fznso::Value arg = model.objective_arg();
 		if (arg.kind() == FznsoValueDecision) {
-			obj[static_cast<std::size_t>(column_[arg.as_decision().index])] = 1.0;
+			auto col = static_cast<std::size_t>(column_[arg.as_decision().index]);
+			if (col < base_column) {
+				if (!extending) {
+					obj[col] = 1.0;
+				}
+				// else: the cost is already on that column from the run that
+				// created it.
+			} else {
+				obj[col - base_column] = 1.0;
+			}
 		}
 		// A fixed objective leaves every cost at zero, which is the same problem.
 	}
@@ -309,9 +370,9 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 	//
 	// Three rows and one binary per interval — not per *value*, which is what
 	// an equality encoding would cost on a wide domain with one hole.
-	const std::size_t model_columns = obj.size();
+	const std::size_t model_columns = base_column + obj.size();
 	std::vector<std::size_t> holey;
-	for (std::size_t c = 0; c < model_columns; c++) {
+	for (std::size_t c = base_column; c < model_columns; c++) {
 		if (intervals_[c].size() > 1) {
 			holey.push_back(c);
 			for (std::size_t r = 0; r < intervals_[c].size(); r++) {
@@ -323,10 +384,14 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 		}
 	}
 
-	columns_ = obj.size();
-	backend.add_columns(columns_, obj.data(), lb.data(), ub.data(), kinds.data());
-	backend.set_objective_sense(maximise);
+	columns_ = base_column + obj.size();
+	backend.add_columns(obj.size(), obj.data(), lb.data(), ub.data(), kinds.data());
+	if (!extending) {
+		backend.set_objective_sense(maximise);
+	}
 
+	// Scratch, sized to the whole model rather than to this call's share: a new
+	// row may name any column, old or new.
 	slot_.assign(columns_, 0);
 	stamp_.assign(columns_, 0);
 	row_id_ = 0;
@@ -363,7 +428,7 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend) {
 	const Capabilities caps = backend.capabilities();
 
 	// --- pass 2: rows -------------------------------------------------------
-	for (std::size_t c = 0; c < constraints; c++) {
+	for (std::size_t c = first_constraint; c < constraints; c++) {
 		if (handled_[c] != 0) {
 			continue;
 		}

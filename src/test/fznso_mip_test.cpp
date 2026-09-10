@@ -399,6 +399,118 @@ void statistics(fznso::Library& lib) {
 	      "an unknown statistic is absent");
 }
 
+/// One solver, run twice, with a layer pushed in between.
+///
+/// The point is the *carrying*: the solver keeps what the first run ended with
+/// and offers it to the backend as a starting point for the second. A start is
+/// advice, so the second answer must obey the new layer whatever was carried —
+/// which is what this checks, because a solver that reported its stale solution
+/// would pass every other test in this file.
+void incremental_rerun(fznso::Library& lib) {
+	LayeredModel m;
+	Decision x = m.add_decision(INT, OwnedValue::int_range(0, 10), "x");
+	Decision y = m.add_decision(INT, OwnedValue::int_range(0, 10), "y");
+	lin_le(m, {1, 1}, {OwnedValue{x}, OwnedValue{y}}, 10);
+	m.set_objective("int_maximize", OwnedValue{x});
+
+	fznso::DynSolver solver = lib.create_solver();
+
+	std::vector<double> first;
+	Status s1 = solver.run(m, [&](const Solution& s) {
+		first = {static_cast<double>(s[x].as_int()), static_cast<double>(s[y].as_int())};
+	});
+	check(s1.complete(), "first run completes");
+	check(!first.empty() && near(first[0], 10.0), "first run maximises x to 10");
+
+	// A layer the solver has not seen, ruling out what it just answered. Layers
+	// 0 and 1 (the base and this one) are all there is, and only layer 0 is
+	// unchanged.
+	m.push_layer();
+	lin_le(m, {1}, {OwnedValue{x}}, 6); // x <= 6
+	m.set_unchanged(1);
+
+	std::vector<double> second;
+	Status s2 = solver.run(m, [&](const Solution& s) {
+		second = {static_cast<double>(s[x].as_int()), static_cast<double>(s[y].as_int())};
+	});
+	check(s2.complete(), "second run completes");
+	check(!second.empty() && near(second[0], 6.0),
+	      "second run obeys the layer added since the first");
+
+	// And once more with the layer retracted: the carried values are feasible
+	// again, and the answer goes back to what it was.
+	m.pop_layer();
+	m.set_unchanged(1);
+	std::vector<double> third;
+	Status s3 = solver.run(m, [&](const Solution& s) {
+		third = {static_cast<double>(s[x].as_int()), static_cast<double>(s[y].as_int())};
+	});
+	check(s3.complete(), "third run completes");
+	check(!third.empty() && near(third[0], 10.0), "third run recovers the original optimum");
+}
+
+/// A layer that brings its own decisions, and one that forces a full rebuild.
+///
+/// Extending covers the ordinary case — a layer of rows over columns that are
+/// already there. These are the two it does not: a layer with new columns, and
+/// a layer whose `bool_to_int` joins two decisions that already have a column
+/// apiece, which cannot be done by adding and has to start over. Both must give
+/// the same answer as building from nothing, which is all the caller can see.
+void incremental_shapes(fznso::Library& lib) {
+	{
+		LayeredModel m;
+		Decision x = m.add_decision(INT, OwnedValue::int_range(0, 10), "x");
+		lin_le(m, {-1}, {OwnedValue{x}}, -2); // x >= 2
+		m.set_objective("int_minimize", OwnedValue{x});
+
+		fznso::DynSolver solver = lib.create_solver();
+		std::int64_t first = -1;
+		Status s1 = solver.run(m, [&](const Solution& s) { first = s[x].as_int(); });
+		check(s1.complete() && first == 2, "layer 0 minimises x to 2");
+
+		// A layer of its own decisions, tied to the old one.
+		m.push_layer();
+		Decision y = m.add_decision(INT, OwnedValue::int_range(0, 10), "y");
+		lin_le(m, {-1, 1}, {OwnedValue{y}, OwnedValue{x}}, -3); // y >= x + 3
+		m.set_unchanged(1);
+
+		std::int64_t gx = -1;
+		std::int64_t gy = -1;
+		Status s2 = solver.run(m, [&](const Solution& s) {
+			gx = s[x].as_int();
+			gy = s[y].as_int();
+		});
+		check(s2.complete() && gx == 2 && gy >= 5, "a layer of new decisions is added, not rebuilt");
+	}
+	{
+		LayeredModel m;
+		Decision b = m.add_decision(BOOL, OwnedValue{}, "b");
+		Decision i = m.add_decision(INT, OwnedValue::int_range(0, 1), "i");
+		lin_le(m, {-1}, {OwnedValue{i}}, -1); // i >= 1
+		m.set_objective("int_minimize", OwnedValue{i});
+
+		fznso::DynSolver solver = lib.create_solver();
+		Status s1 = solver.run(m, [](const Solution&) {});
+		check(s1.complete(), "two separate columns to begin with");
+
+		// Now say they were the same column all along. Two classes that each
+		// own a column cannot be merged in place, so this must start over —
+		// and still answer.
+		m.push_layer();
+		m.add_constraint("bool_to_int", {OwnedValue{b}, OwnedValue{i}});
+		m.set_unchanged(1);
+
+		bool bv = false;
+		std::int64_t iv = -1;
+		Status s2 = solver.run(m, [&](const Solution& s) {
+			bv = s[b].as_bool();
+			iv = s[i].as_int();
+		});
+		check(s2.complete() && bv && iv == 1, "a late join rebuilds and still agrees");
+		check(solver.statistic("decisions").as_int() == 1, "the late join really did merge them");
+	}
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -423,6 +535,8 @@ int main(int argc, char** argv) {
 		declared_constraints_post(lib);
 		options(lib);
 		statistics(lib);
+		incremental_rerun(lib);
+		incremental_shapes(lib);
 	} catch (const std::exception& e) {
 		std::fprintf(stderr, "FAIL: %s\n", e.what());
 		return 1;

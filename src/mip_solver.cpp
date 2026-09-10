@@ -1,7 +1,9 @@
 #include "mip_solver.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <vector>
 
 namespace fznso_mip {
@@ -173,6 +175,114 @@ fznso::Value MipSolver::statistic(std::string_view name) const {
 	return backend_->statistic(name);
 }
 
+namespace {
+
+/// Collect `warm_start(xs, vs)` out of `annotation`, keyed by decision index.
+///
+/// Only the flat form arrives. MiniZinc also writes `warm_start_array([...])`
+/// and puts warm starts inside `seq_search`, but an annotation argument is a
+/// *value* and no value kind is an annotation — so a grouped warm start cannot
+/// cross this interface at all, and what reaches here is whatever was written
+/// directly on the solve item.
+///
+/// Everything here is advice: a pair that does not line up, or one naming a
+/// decision this model does not have, is skipped rather than reported. A warm
+/// start cannot make an answer wrong, so a malformed one is not worth a
+/// diagnostic.
+void collect_warm_start(fznso::AnnotationRef annotation, std::map<std::size_t, double>& into) {
+	if (annotation.ident() != "warm_start" || annotation.size() != 2) {
+		return;
+	}
+	fznso::Value xs = annotation[0];
+	fznso::Value vs = annotation[1];
+	if (xs.kind() != FznsoValueList || vs.kind() != FznsoValueList || xs.size() != vs.size()) {
+		return;
+	}
+	for (std::size_t i = 0; i < xs.size(); i++) {
+		fznso::Value x = xs[i];
+		fznso::Value v = vs[i];
+		if (x.kind() != FznsoValueDecision) {
+			continue;
+		}
+		switch (v.kind()) {
+		case FznsoValueBool:
+			into[x.as_decision().index] = v.as_bool() ? 1.0 : 0.0;
+			break;
+		case FznsoValueInt:
+			into[x.as_decision().index] = static_cast<double>(v.as_int());
+			break;
+		case FznsoValueFloat:
+			into[x.as_decision().index] = v.as_float();
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+} // namespace
+
+void MipSolver::remember(const double* values, std::size_t len, const MipModel& built,
+                         std::size_t decisions) {
+	last_.assign(decisions, 0.0);
+	last_known_.assign(decisions, false);
+	for (std::size_t d = 0; d < decisions; d++) {
+		int col = built.column_of(d);
+		if (col < 0 || static_cast<std::size_t>(col) >= len) {
+			continue;
+		}
+		last_[d] = values[static_cast<std::size_t>(col)];
+		last_known_[d] = true;
+	}
+}
+
+void MipSolver::offer_start(const fznso::Model& model, const MipModel& built) {
+	std::map<std::size_t, double> start;
+
+	// The model's own advice first, so that a value carried over from the last
+	// run overwrites it: an annotation is a guess made before anything was
+	// solved, and a solution is one the search itself produced.
+	for (std::size_t i = 0; i < model.objective_annotation_count(); i++) {
+		collect_warm_start(model.objective_annotation(i), start);
+	}
+
+	// Layers say how much of the model the solver has already seen, and index
+	// order follows layer order, so decisions below the end of the last
+	// unchanged layer are the same variables they were last run. Above it they
+	// are not, and a value carried up there would be a guess about a different
+	// variable.
+	std::size_t unchanged = model.layer_unchanged();
+	std::size_t prefix = unchanged == 0 ? 0 : model.decision_layer_end(unchanged - 1);
+	prefix = std::min(prefix, last_known_.size());
+	for (std::size_t d = 0; d < prefix; d++) {
+		if (last_known_[d]) {
+			start[d] = last_[d];
+		}
+	}
+
+	if (start.empty()) {
+		return;
+	}
+	std::vector<int> cols;
+	std::vector<double> values;
+	cols.reserve(start.size());
+	values.reserve(start.size());
+	for (const auto& entry : start) {
+		if (entry.first >= model.decision_count()) {
+			continue;
+		}
+		int col = built.column_of(entry.first);
+		if (col < 0 || static_cast<std::size_t>(col) >= built.column_count()) {
+			continue;
+		}
+		cols.push_back(col);
+		values.push_back(entry.second);
+	}
+	if (!cols.empty()) {
+		backend_->set_start(cols.size(), cols.data(), values.data());
+	}
+}
+
 fznso::Status MipSolver::run(const fznso::Model& model, fznso::SolutionSink& solutions,
                              fznso::MessageSink& messages, const fznso::StopSignal& stop) {
 	// Polled before starting, so a caller that has already asked to stop gets no
@@ -183,16 +293,79 @@ fznso::Status MipSolver::run(const fznso::Model& model, fznso::SolutionSink& sol
 
 	auto started = std::chrono::steady_clock::now();
 
-	// No incrementality: the model is rebuilt every run, so `layer_unchanged()`
-	// is ignored. Always correct, just not incremental.
-	backend_->reset();
-	MipModel built;
-	std::string error = built.build(model, *backend_);
+	// How much of what the backend already holds is still this model. A cost is
+	// a column property, fixed when the column was handed over, so a changed
+	// objective means starting again whatever the layers say.
+	std::string_view objective_ident = model.objective_ident();
+	fznso::Value objective_value = model.objective_arg();
+	bool objective_is_decision = objective_value.kind() == FznsoValueDecision;
+	std::size_t objective_arg = objective_is_decision ? objective_value.as_decision().index : 0;
+	bool objective_same = built_objective_ == objective_ident &&
+	                      built_objective_is_decision_ == objective_is_decision &&
+	                      built_objective_arg_ == objective_arg;
+
+	std::size_t keep = std::min(model.layer_unchanged(), built_layers_);
+	if (!backend_->capabilities().incremental || !objective_same || keep == 0 ||
+	    keep > layer_end_.size()) {
+		keep = 0;
+	}
+	if (keep == 0) {
+		backend_->reset();
+		built_ = MipModel{};
+		layer_end_.clear();
+	} else if (keep < built_layers_) {
+		// Layers were retracted. Indices follow layer order, so what they took
+		// with them is a suffix of the columns and rows, and cutting it leaves
+		// everything below numbered as it was.
+		const LayerEnd& end = layer_end_[keep - 1];
+		backend_->truncate(end.rows, end.columns);
+		built_.truncate(end.decisions, end.columns, end.rows);
+		layer_end_.resize(keep);
+	}
+
+	std::string error;
+	std::size_t layers = model.layer_count();
+	for (std::size_t l = keep; l < layers; l++) {
+		std::size_t first_decision = l == 0 ? 0 : model.decision_layer_end(l - 1);
+		std::size_t first_constraint = l == 0 ? 0 : model.constraint_layer_end(l - 1);
+		error = built_.build(model, *backend_, first_decision, first_constraint, l != 0 || keep != 0);
+		if (error == MipModel::kNeedsFullBuild) {
+			// A layer joined two classes that already had a column apiece, or
+			// narrowed one the backend was given earlier. Rare, and starting
+			// over is always right.
+			backend_->reset();
+			built_ = MipModel{};
+			layer_end_.clear();
+			error = built_.build(model, *backend_);
+			break;
+		}
+		if (!error.empty()) {
+			break;
+		}
+		layer_end_.push_back(
+			LayerEnd{built_.column_count(), built_.row_count(), model.decision_layer_end(l)});
+	}
 	if (!error.empty()) {
+		backend_->reset();
+		built_ = MipModel{};
+		layer_end_.clear();
+		built_layers_ = 0;
 		return fznso::Status{fznso::Status::Kind::Error, std::move(error)};
 	}
+	built_layers_ = layers;
+	built_objective_ = std::string{objective_ident};
+	built_objective_is_decision_ = objective_is_decision;
+	built_objective_arg_ = objective_arg;
+	if (layer_end_.size() != layers) {
+		// The fallback above rebuilt everything in one go, so there are no
+		// per-layer ends to truncate to next time.
+		layer_end_.clear();
+		built_layers_ = 0;
+	}
+	const MipModel& built = built_;
 	columns_ = built.column_count();
 	rows_ = built.row_count();
+	offer_start(model, built);
 	init_time_ = seconds_since(started);
 
 	std::string_view objective = model.objective_ident();
@@ -243,6 +416,7 @@ fznso::Status MipSolver::run(const fznso::Model& model, fznso::SolutionSink& sol
 					break;
 				}
 			}
+			owner_.remember(values, len, built_, wanted_.size());
 			owner_.objective_ = objective;
 			Solution src{std::move(assignment), owner_.solutions_, owner_.float_objective_,
 			             owner_.have_objective_ ? std::optional<double>{objective}

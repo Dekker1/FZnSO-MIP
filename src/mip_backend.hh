@@ -90,6 +90,10 @@ struct Capabilities {
 	bool solution_pool = false;
 	/// Continuous columns at all, so `var float` is a decision type.
 	bool floats = true;
+	/// Rows and columns can be dropped from the end of a model that has already
+	/// been solved, which is what lets a run keep whatever an unchanged prefix
+	/// of layers built and post only what lies above it.
+	bool incremental = false;
 };
 
 /// Everything one solve produced, apart from the solutions already streamed.
@@ -156,6 +160,29 @@ public:
 
 	/// `x[out_col] = x[a_col] · x[b_col]`.
 	virtual void add_quadratic_row(int out_col, int a_col, int b_col);
+
+	// --- incremental --------------------------------------------------------
+
+	/// Offer values for some columns as a starting point for the next `solve`.
+	///
+	/// A hint, never a constraint: a backend may ignore it, and it stays correct
+	/// if the values are infeasible or contradict each other. Sparse because
+	/// what a caller knows is usually a prefix of the columns — the variables a
+	/// previous run shared with this one — and saying nothing about a column is
+	/// not the same as saying zero.
+	///
+	/// The default does nothing, which is what a backend with no such notion
+	/// wants: unlike the capability-gated methods above, nothing declares this,
+	/// so it must be safe to leave alone.
+	virtual void set_start(std::size_t n, const int* cols, const double* values);
+
+	/// Drop every row from `first` onwards, and every column from `first_col`.
+	///
+	/// Only a suffix, which is the only shape the layer rules can ask for:
+	/// indices follow layer order, so retracting layers retracts a range at the
+	/// end and never renumbers anything below it. Reached only when
+	/// `Capabilities::incremental` is set.
+	virtual void truncate(std::size_t first_row, std::size_t first_col);
 };
 
 } // namespace fznso_mip

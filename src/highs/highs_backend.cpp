@@ -26,7 +26,8 @@ using namespace fznso_mip;
 /// no solution pool. The declared list and the constraint dispatch both read
 /// this, so they cannot drift apart.
 constexpr Capabilities kHighsCaps{/*indicators=*/false, /*quadratic=*/false,
-                                  /*solution_pool=*/false, /*floats=*/true};
+                                  /*solution_pool=*/false, /*floats=*/true,
+                                  /*incremental=*/true};
 
 /// What the HiGHS callback is given, since it cannot be a member function.
 struct CallbackState {
@@ -88,6 +89,35 @@ public:
 		check(Highs_changeObjectiveSense(highs_,
 		                                 maximise ? kHighsObjSenseMaximize : kHighsObjSenseMinimize),
 		      "unable to set the objective sense");
+	}
+
+	void truncate(std::size_t first_row, std::size_t first_col) override {
+		HighsInt rows = Highs_getNumRow(highs_);
+		if (static_cast<HighsInt>(first_row) < rows) {
+			check(Highs_deleteRowsByRange(highs_, static_cast<HighsInt>(first_row), rows - 1),
+			      "unable to delete rows");
+		}
+		HighsInt cols = Highs_getNumCol(highs_);
+		if (static_cast<HighsInt>(first_col) < cols) {
+			check(Highs_deleteColsByRange(highs_, static_cast<HighsInt>(first_col), cols - 1),
+			      "unable to delete columns");
+		}
+		// The model is not the one the last solve was about any more, so
+		// whatever it left behind — basis, incumbent, cuts — has to go with it.
+		check(Highs_clearSolver(highs_), "unable to clear the solver");
+	}
+
+	void set_start(std::size_t n, const int* cols, const double* values) override {
+		if (n == 0) {
+			return;
+		}
+		// `Highs_setSparseSolution` names only the columns it knows, which is
+		// what a caller carrying a previous run's answer has: the columns of the
+		// decisions the two runs share. HiGHS computes the violation and the
+		// objective from it and takes it as a MIP start; an infeasible one costs
+		// the search nothing, so this need not be checked first.
+		check(Highs_setSparseSolution(highs_, static_cast<HighsInt>(n), cols, values),
+		      "unable to set the starting solution");
 	}
 
 	RunOutcome solve(const MipOptions& options, MipSink& sink) override;

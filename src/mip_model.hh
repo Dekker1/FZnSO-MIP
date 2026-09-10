@@ -31,8 +31,28 @@ public:
 		double max;
 	};
 
-	/// Post `model` into `backend`. Returns an error message, or empty on success.
-	std::string build(const fznso::Model& model, MipBackend& backend);
+	/// Returned by `build` when the model cannot be extended in place and the
+	/// caller should start again from nothing. Not an error: the answer would be
+	/// the same either way, only the work is.
+	static const char* const kNeedsFullBuild;
+
+	/// Post `model` into `backend`. Returns an error message, or empty on
+	/// success.
+	///
+	/// With `first_decision` and `first_constraint` at zero this builds the whole
+	/// model into an empty backend. Above zero it *extends* what a previous call
+	/// left behind — the caller having truncated the backend to match — and only
+	/// decisions and constraints from those indices on are posted. Everything
+	/// below them keeps the columns and rows it already had, which is what makes
+	/// the indices in `column_of` stable across runs.
+	std::string build(const fznso::Model& model, MipBackend& backend,
+	                  std::size_t first_decision = 0, std::size_t first_constraint = 0,
+	                  bool extending = false);
+
+	/// Forget everything above a prefix, after the backend has been truncated to
+	/// match. A layer that has been retracted took its decisions, columns and
+	/// rows with it.
+	void truncate(std::size_t decisions, std::size_t columns, std::size_t rows);
 
 	/// The column standing for a decision.
 	int column_of(std::size_t decision) const { return column_[decision]; }
