@@ -71,8 +71,8 @@ private:
 	};
 	std::vector<LayerEnd> layer_end_;
 	std::string built_objective_;
-	std::size_t built_objective_arg_ = 0;
-	bool built_objective_is_decision_ = false;
+	/// The decisions the built objective names, in order; see `run`.
+	std::vector<std::size_t> built_objective_args_;
 
 	// Statistics of the last run.
 	std::int64_t solutions_ = 0;

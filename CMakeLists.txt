@@ -45,7 +45,7 @@ target_compile_options(fznso-mip-core PRIVATE -Wall -Wextra)
 # `lib/fznso/` keeps it apart from the library it wraps.
 function(fznso_mip_backend name)
   add_library(fznso-${name} SHARED ${ARGN} $<TARGET_OBJECTS:fznso-mip-core>)
-  target_link_libraries(fznso-${name} PRIVATE fznso-mip-core highs::highs)
+  target_link_libraries(fznso-${name} PRIVATE fznso-mip-core)
   target_compile_options(fznso-${name} PRIVATE -Wall -Wextra)
   set_target_properties(fznso-${name} PROPERTIES
     OUTPUT_NAME ${name}
@@ -55,9 +55,19 @@ function(fznso_mip_backend name)
 endfunction()
 
 fznso_mip_backend(highs src/highs/highs_backend.cpp)
+# HiGHS is this backend's alone: Gurobi links nothing, because it opens whatever
+# is installed at run time rather than being built against it.
+target_link_libraries(fznso-highs PRIVATE highs::highs)
 # `highs_c_api.h` declares a `static` function it does not define.
 set_source_files_properties(src/highs/highs_backend.cpp
   PROPERTIES COMPILE_OPTIONS -Wno-unused-function)
+
+# Gurobi, found and opened at run time. Nothing but the loader is needed to
+# build it, so this is here whether or not the machine has a Gurobi.
+fznso_mip_backend(gurobi src/gurobi/gurobi_backend.cpp)
+if(NOT WIN32)
+  target_link_libraries(fznso-gurobi PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # The self-test loads a built library the way a consumer does, so it exercises
 # the entry-point naming and the export path as well as the behaviour.
@@ -68,5 +78,8 @@ target_compile_options(fznso-mip-test PRIVATE -Wall -Wextra)
 if(NOT WIN32)
   target_link_libraries(fznso-mip-test PRIVATE ${CMAKE_DL_LIBS})
 endif()
-add_dependencies(fznso-mip-test fznso-highs)
+add_dependencies(fznso-mip-test fznso-highs fznso-gurobi)
 add_test(NAME fznso-highs COMMAND fznso-mip-test $<TARGET_FILE:fznso-highs>)
+# The same suite, against a backend that may have nothing to load: it checks
+# what a machine with no Gurobi must still answer and stops there.
+add_test(NAME fznso-gurobi COMMAND fznso-mip-test $<TARGET_FILE:fznso-gurobi>)

@@ -28,29 +28,23 @@ bool: MIP_domains = if absent(fMIPdomains) then true else deopt(fMIPdomains) end
 opt bool: fMIPdomAux;
 bool: MIP_domains_aux = if absent(fMIPdomAux) then false else deopt(fMIPdomAux) endif;
 
-% Quadratic rows. Only a backend declaring `Capabilities::quadratic` may turn
-% these on: without the declaration the native call rewrites straight back into
-% the decomposition it came from.
-opt bool: QuadrFloat;
-bool: MIP_quadratic_float = if absent(QuadrFloat) then false else deopt(QuadrFloat) endif;
+% Quadratic rows are not a flag. A backend that has them declares `int_times`
+% and `float_times`, which replaces `fzn_int_times` and `fzn_float_times`
+% outright, so the constraint never reaches a decomposition to be gated. There
+% is nothing for `-D QuadrFloat` to switch on: the only call those files could
+% make is to the FlatZinc builtin, and the rewrite layer defines that as the
+% `fzn_` predicate doing the calling. `linear/`'s names are kept below so a
+% backend author does not invent new ones.
 
-opt bool: QuadrInt;
-opt int: QuadrIntCard;
-% Take the native product once the smaller domain has this many values.
-int: MIP_quadratic_int_card =
-  if occurs(QuadrIntCard) then
-    deopt(QuadrIntCard)
-  elseif occurs(QuadrInt) /\ deopt(QuadrInt) then
-    0
-  else
-    infinity
-  endif;
-
-% Nothing below reads these yet: each belongs to a decomposition still to be
+% Nothing below reads these: each belongs to a decomposition still to be
 % ported (`fzn_int_circuit`, `fzn_int_regular`, the `lex` family) or to a native
 % predicate only a `<solver>.mzn` can name, which a shared file cannot. They are
 % kept so that a backend author finds `linear/`'s names rather than inventing
 % new ones — and so the library does not quietly become HiGHS-shaped.
+
+opt bool: QuadrFloat;
+opt bool: QuadrInt;
+opt int: QuadrIntCard;
 
 opt int: nSECcuts; % 0: MTZ; 1, 2: hand circuits to the cut generator
 int: MIP_sec_cuts = if absent(nSECcuts) then 0 else deopt(nSECcuts) endif;

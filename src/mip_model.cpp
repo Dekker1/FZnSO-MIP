@@ -336,16 +336,38 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend,
 	// objective is the one it built for.
 	std::string_view objective = model.objective_ident();
 	bool maximise = false;
+	// A lexicographic objective is not a cost on a column, so it is collected
+	// here and handed over once the columns exist.
+	bool lexicographic = false;
+	std::vector<int> lex_cols;
 	if (!objective.empty()) {
 		if (objective == "int_minimize" || objective == "float_minimize") {
 			maximise = false;
 		} else if (objective == "int_maximize" || objective == "float_maximize") {
 			maximise = true;
+		} else if (objective == "int_lex_minimize" || objective == "float_lex_minimize") {
+			maximise = false;
+			lexicographic = true;
+		} else if (objective == "int_lex_maximize" || objective == "float_lex_maximize") {
+			maximise = true;
+			lexicographic = true;
 		} else {
 			return "unsupported objective `" + std::string{objective} + "'";
 		}
 		fznso::Value arg = model.objective_arg();
-		if (arg.kind() == FznsoValueDecision) {
+		if (lexicographic) {
+			// A fixed entry contributes nothing to the ranking — every
+			// assignment scores the same on it — so it is dropped rather than
+			// given a column of its own.
+			std::size_t n = arg.size();
+			lex_cols.reserve(n);
+			for (std::size_t i = 0; i < n; i++) {
+				fznso::Value entry = arg[i];
+				if (entry.kind() == FznsoValueDecision) {
+					lex_cols.push_back(column_[entry.as_decision().index]);
+				}
+			}
+		} else if (arg.kind() == FznsoValueDecision) {
 			auto col = static_cast<std::size_t>(column_[arg.as_decision().index]);
 			if (col < base_column) {
 				if (!extending) {
@@ -387,7 +409,11 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend,
 	columns_ = base_column + obj.size();
 	backend.add_columns(obj.size(), obj.data(), lb.data(), ub.data(), kinds.data());
 	if (!extending) {
-		backend.set_objective_sense(maximise);
+		if (lexicographic) {
+			backend.set_lex_objective(lex_cols.size(), lex_cols.data(), maximise);
+		} else {
+			backend.set_objective_sense(maximise);
+		}
 	}
 
 	// Scratch, sized to the whole model rather than to this call's share: a new
@@ -566,18 +592,23 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend,
 			int ca = column_arg(arg(0), la);
 			int cb = column_arg(arg(1), lb2);
 			int cc = column_arg(arg(2), lc);
-			if (ca < 0 || cb < 0 || cc < 0) {
-				// With any operand fixed the product is linear, so say it that way.
+			if (ca >= 0 && cb >= 0) {
+				// Both operands are decisions, so this is genuinely quadratic —
+				// whether or not the result is one. A fixed result is the
+				// product against a value rather than against a column, which
+				// is a quadratic row all the same and not a linearisable one.
+				backend.add_quadratic_row(cc, ca, cb, cc >= 0 ? 0.0 : lc);
+				++rows_;
+			} else {
+				// With an operand fixed the product is linear, so say it that way.
 				row_begin();
 				double rhs = 0.0;
 				if (ca < 0 && cb >= 0) {
 					row_add(cb, la);
 				} else if (cb < 0 && ca >= 0) {
 					row_add(ca, lb2);
-				} else if (ca < 0 && cb < 0) {
-					rhs -= la * lb2;
 				} else {
-					return std::string{ident} + ": cannot linearise this product";
+					rhs -= la * lb2;
 				}
 				if (cc >= 0) {
 					row_add(cc, -1.0);
@@ -585,9 +616,6 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend,
 					rhs += lc;
 				}
 				row_post(backend, RowSense::Eq, rhs);
-			} else {
-				backend.add_quadratic_row(cc, ca, cb);
-				++rows_;
 			}
 		} else {
 			return "unknown constraint `" + std::string{ident} + "'";

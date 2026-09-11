@@ -8,7 +8,18 @@ include "fzn_int_times.mzn";
 include "fzn_int_abs.mzn";
 include "fzn_int_lin_le_reif.mzn";
 
-function array [int] of var int: mip_int_divmod(var int: a, var int: b) =
+% Total, which is what lets a backend with indicator or quadratic rows use them
+% here. Division is partial in `b = 0`, but that is settled above: the standard
+% library reaches `fzn_int_div` and `fzn_int_mod` only through `div_t`, which is
+% itself `promise_total` and posts `b != 0` at root (`div_mt` maps `0` to `1`),
+% so `b` is non-zero by the time this is called — and `magnitude` below states
+% `|b| >= 1` in any case.
+%
+% Without it the constraints in this `let` are reified wherever the enclosing
+% expression is, and a native `fzn_int_lin_le_imp` or `fzn_int_times` has no
+% reified form to reify into, so the model does not flatten at all.
+function array [int] of var int: mip_int_divmod(var int: a, var int: b)
+  :: promise_total =
   let {
     set of int: quotients =
       if lb(b) * ub(b) > 0 then

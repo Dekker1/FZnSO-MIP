@@ -12,7 +12,12 @@ void MipBackend::add_indicator_row(int /*bin_col*/, bool /*on_value*/, std::size
 	throw std::logic_error("this backend declared indicator constraints but implements none");
 }
 
-void MipBackend::add_quadratic_row(int /*out_col*/, int /*a_col*/, int /*b_col*/) {
+void MipBackend::set_lex_objective(std::size_t /*n*/, const int* /*cols*/, bool /*maximise*/) {
+	throw std::logic_error("this backend declared lexicographic objectives but implements none");
+}
+
+void MipBackend::add_quadratic_row(int /*out_col*/, int /*a_col*/, int /*b_col*/,
+                                   double /*rhs*/) {
 	throw std::logic_error("this backend declared quadratic constraints but implements none");
 }
 

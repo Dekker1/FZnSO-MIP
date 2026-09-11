@@ -15,7 +15,9 @@ solver-specific**. Adding Gurobi is one subdirectory under `src/`, one
 | `src/mip_model.*` | the model walk: aliasing pre-pass, columns, rows, objective |
 | `src/mip_solver.*` | `fznso::Solver` — options, statistics, solutions, stopping |
 | `src/signatures.*` | the five capability lists, derived from `Capabilities` |
-| `src/highs/` | the backend and the export |
+| `src/highs/` | the linked-in backend and its export |
+| `src/gurobi/` | the same, for a Gurobi found at run time |
+| `mznlib-gurobi/` | what Gurobi posts natively where `mznlib/` decomposes |
 | `src/test/` | the self-test, run against each built backend |
 | `mznlib/` | the shared linear library — see its own README |
 
@@ -74,6 +76,26 @@ flattener's include path. See `mznlib/README.md` for where the line is drawn and
 
 `cargo run -p fznso-conform -- check build/lib/fznso/Debug/libhighs.dylib`
 checks it against the registry.
+
+## What Gurobi declares
+
+Fifteen constraints: the same nine, plus the four half-reified linear forms and
+the two products. Eight objectives, where HiGHS declares four — the `_lex_`
+family is Gurobi's `GRBsetobjectiven`, one objective per variable ranked by
+priority, which is the registry's ordering exactly. And `open_nodes` beside the
+shared statistics, plus three of its own under `gurobi_`. Each of those six costs a `MipBackend` method whose default throws,
+and each is worth what it saves — a declared `int_lin_le_imp` is one indicator
+constraint where the library's decomposition is a big-M row and a binary
+column.
+
+Gurobi is **not linked in**. `src/gurobi/` opens whatever is installed at run
+time, the way MiniZinc's own wrapper finds it, and nothing in the build needs a
+Gurobi to be present. That is also why the two calls that can carry a
+message — `MipBackend::option_set` and `solve` — are the only places a missing
+one is reported: the five capability lists and `solver_create` are how a
+consumer decides whether to use the solver at all, so they answer on a machine
+with no Gurobi, and neither can say why. `gurobi_dll` points the loader
+somewhere else, and must be settable before anything has been tried.
 
 ## Incremental runs
 

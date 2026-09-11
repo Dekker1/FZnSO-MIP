@@ -353,9 +353,12 @@ void declared_constraints_post(fznso::Library& lib) {
 	                          "int_to_float"}) {
 		check(seen.count(ident) == 1, ident);
 	}
-	// A constraint the backend cannot post must not be declared.
+	// No MIP posts any of these as one row, whatever else it can do, so none of
+	// them may be declared by any backend. `int_times` is deliberately not in
+	// the list: a backend with quadratic rows declares it, and one without does
+	// not, so it says nothing about every backend.
 	for (const char* ident : {"int_lin_ne", "int_lin_le_reif", "int_lin_eq_reif",
-	                          "bool_array_and", "bool_array_xor", "int_times", "all_solutions"}) {
+	                          "bool_array_and", "bool_array_xor", "all_solutions"}) {
 		check(seen.count(ident) == 0, ident);
 	}
 }
@@ -511,6 +514,177 @@ void incremental_shapes(fznso::Library& lib) {
 	}
 }
 
+/// `x · y = 6` with `x <= 2`, for a backend that declares `int_times`.
+///
+/// The product of two decisions against a *value*: there is no third decision
+/// to hold the result, so it is a quadratic row with no linear term rather than
+/// a linearisable one. Skipped where `int_times` is not declared, since the
+/// constraint then never reaches the backend at all.
+void product_against_a_value(fznso::Library& lib) {
+	FznsoConstraintList declared = lib.constraint_types();
+	bool quadratic = false;
+	for (std::size_t i = 0; i < declared.len; i++) {
+		std::string ident{declared.constraints[i].ident.ptr, declared.constraints[i].ident.len};
+		quadratic = quadratic || ident == "int_times";
+	}
+	if (!quadratic) {
+		return;
+	}
+	LayeredModel m;
+	Decision x = m.add_decision(INT, OwnedValue::int_range(1, 6), "x");
+	Decision y = m.add_decision(INT, OwnedValue::int_range(1, 6), "y");
+	m.add_constraint("int_times", {OwnedValue{x}, OwnedValue{y}, num(6)});
+	lin_le(m, {1}, {OwnedValue{x}}, 2);
+	m.set_objective("int_maximize", OwnedValue{x});
+
+	Collected out = solve(lib, m, 2);
+	check(out.status.complete(), "a product against a value completes");
+	check(!out.solutions.empty(), "a product against a value reports a solution");
+	if (!out.solutions.empty()) {
+		const std::vector<double>& sol = out.solutions.back();
+		check(near(sol[0] * sol[1], 6.0), "the product holds");
+		check(near(sol[0], 2.0), "and the objective is maximised within it");
+	}
+}
+
+/// `x + y <= 10` maximised lexicographically: `x` first, then `y`.
+///
+/// The point is the *ranking*. A weighted sum would let a large `y` buy a
+/// smaller `x`; a lexicographic objective may not, so the only answer is the
+/// largest `x` the constraint allows and the best `y` given it. Skipped where
+/// the objective is not declared.
+void lex_objective(fznso::Library& lib) {
+	FznsoObjectiveList declared = lib.objectives();
+	bool lex = false;
+	for (std::size_t i = 0; i < declared.len; i++) {
+		std::string ident{declared.objectives[i].ident.ptr, declared.objectives[i].ident.len};
+		lex = lex || ident == "int_lex_maximize";
+	}
+	if (!lex) {
+		return;
+	}
+	LayeredModel m;
+	Decision x = m.add_decision(INT, OwnedValue::int_range(0, 6), "x");
+	Decision y = m.add_decision(INT, OwnedValue::int_range(0, 6), "y");
+	lin_le(m, {1, 1}, {OwnedValue{x}, OwnedValue{y}}, 10);
+	m.set_objective("int_lex_maximize", list({OwnedValue{x}, OwnedValue{y}}));
+
+	Collected out = solve(lib, m, 2);
+	check(out.status.complete(), "a lexicographic objective completes");
+	check(!out.solutions.empty(), "a lexicographic objective reports a solution");
+	if (!out.solutions.empty()) {
+		const std::vector<double>& sol = out.solutions.back();
+		// `x` is maximised first, so it takes its whole domain and `y` gets
+		// what is left. A weighted sum over these could prefer x=5,y=5.
+		check(near(sol[0], 6.0), "the first objective is maximised");
+		check(near(sol[1], 4.0), "and the second only within what it left");
+	}
+}
+
+/// Whether an option is the core's rather than a backend's.
+bool core_option(const std::string& ident) {
+	for (const char* core : {"intermediate", "threads", "time_limit", "random_seed", "verbose",
+	                         "all_solutions"}) {
+		if (ident == core) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/// The backend's library-path option, if it has one.
+///
+/// A backend that opens its solver at run time declares `<solver>_dll`, the
+/// counterpart of MiniZinc's `--<solver>-dll`; one linked against its solver
+/// has nothing to point anywhere.
+std::string dll_option(fznso::Library& lib) {
+	FznsoOptionList options = lib.options();
+	for (std::size_t i = 0; i < options.len; i++) {
+		std::string ident{options.options[i].ident.ptr, options.options[i].ident.len};
+		if (ident.size() > 4 && ident.compare(ident.size() - 4, 4, "_dll") == 0) {
+			return ident;
+		}
+	}
+	return {};
+}
+
+/// One of the backend's own float options, whichever it is.
+///
+/// The core's options are answered above the backend, so setting one says
+/// nothing about whether the backend reached its solver.
+std::string backend_float_option(fznso::Library& lib) {
+	FznsoOptionList options = lib.options();
+	for (std::size_t i = 0; i < options.len; i++) {
+		std::string ident{options.options[i].ident.ptr, options.options[i].ident.len};
+		if (!core_option(ident) && options.options[i].arg_ty.base == FznsoTypeBaseFloat) {
+			return ident;
+		}
+	}
+	return {};
+}
+
+/// What a backend that cannot reach its solver still owes a consumer.
+///
+/// A backend loaded at run time is built, loaded, and asked what it can do on a
+/// machine that has none of its solver installed. The five lists and
+/// `solver_create` are how a consumer decides whether to use it at all, so they
+/// have to answer there — and neither can carry a message. The two calls that
+/// can are `option_set` and `run`; both must report it, both must say the same
+/// thing, and it must name what was tried, because a list of paths that did not
+/// open is the difference between a fixed installation and a bug report.
+///
+/// Pointing the backend at a library that is not there is that state exactly,
+/// and is reachable whether or not this machine has the real thing.
+void unavailable_backend(fznso::Library& lib, const std::string& dll) {
+	check(lib.constraint_types().len > 0, "an unavailable backend still declares constraints");
+	check(lib.decision_types().len > 0, "an unavailable backend still declares decision types");
+	check(lib.objectives().len > 0, "an unavailable backend still declares objectives");
+	check(lib.options().len > 0, "an unavailable backend still declares options");
+	check(lib.statistics().len > 0, "an unavailable backend still declares statistics");
+
+	std::string float_option = backend_float_option(lib);
+	check(!float_option.empty(), "a run-time-loaded backend declares an option of its own");
+	if (float_option.empty()) {
+		return;
+	}
+
+	fznso::DynSolver solver = lib.create_solver();
+	const std::string nowhere = "/nonexistent/fznso-no-such-solver-library";
+	OwnedValue path{nowhere};
+	check(!solver.option_set(dll, fznso::Value{path}).has_value(),
+	      "the library path is settable before anything has been loaded");
+
+	std::optional<std::string> rejected = solver.option_set(float_option, fznso::Value{1e-6});
+	check(rejected.has_value(), "option_set reports that the solver could not be loaded");
+
+	LayeredModel m;
+	Decision x = m.add_decision(INT, OwnedValue::int_range(0, 1), "x");
+	lin_le(m, {1}, {OwnedValue{x}}, 1);
+	Status status = solver.run(m, [](const Solution&) {});
+	check(status.failed(), "run reports that the solver could not be loaded");
+	check(rejected.has_value() && status.error == *rejected,
+	      "option_set and run report the same failure");
+	check(status.error.find(nowhere) != std::string::npos, "the failure names what was tried");
+}
+
+/// Why the backend cannot solve at all, if it cannot.
+///
+/// Everything below this point in the suite assumes a solver that answers, and
+/// a run-time-loaded backend on a machine without its solver does not. What it
+/// owes a consumer anyway is `unavailable_backend`, which has just been run
+/// against it.
+std::optional<std::string> unavailable(fznso::Library& lib) {
+	LayeredModel m;
+	Decision x = m.add_decision(INT, OwnedValue::int_range(0, 1), "x");
+	lin_le(m, {1}, {OwnedValue{x}}, 1);
+	fznso::DynSolver solver = lib.create_solver();
+	Status status = solver.run(m, [](const Solution&) {});
+	if (status.failed()) {
+		return status.error;
+	}
+	return std::nullopt;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -520,7 +694,19 @@ int main(int argc, char** argv) {
 	}
 	try {
 		fznso::Library lib{argv[1]};
+		std::string dll = dll_option(lib);
+		if (!dll.empty()) {
+			unavailable_backend(lib, dll);
+		}
+		if (std::optional<std::string> why = unavailable(lib)) {
+			// This machine has none of the solver, so nothing below can run.
+			std::printf("solver not installed, checked what it must answer anyway: %s\n",
+			            why->c_str());
+			return failures == 0 ? 0 : 1;
+		}
 		int_model(lib);
+		product_against_a_value(lib);
+		lex_objective(lib);
 		bool_model(lib);
 		bool_lin_model(lib);
 		aliasing(lib);

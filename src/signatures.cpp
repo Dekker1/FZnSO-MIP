@@ -86,6 +86,17 @@ Declarations::Declarations(Capabilities capabilities, std::vector<FznsoOption> e
 		objectives_.push_back(FznsoObjective{fznso::str("float_minimize"), kVF});
 		objectives_.push_back(FznsoObjective{fznso::str("float_maximize"), kVF});
 	}
+	if (capabilities.lexicographic) {
+		// Priority order, not a weighted sum: a backend that can rank
+		// objectives says so, and one that cannot leaves these undeclared
+		// rather than picking weights on the consumer's behalf.
+		objectives_.push_back(FznsoObjective{fznso::str("int_lex_minimize"), kAVI});
+		objectives_.push_back(FznsoObjective{fznso::str("int_lex_maximize"), kAVI});
+		if (floats) {
+			objectives_.push_back(FznsoObjective{fznso::str("float_lex_minimize"), kAVF});
+			objectives_.push_back(FznsoObjective{fznso::str("float_lex_maximize"), kAVF});
+		}
+	}
 
 	options_ = {
 		FznsoOption{fznso::str("intermediate"), kB, fznso::Value{defaults().no}.raw()},

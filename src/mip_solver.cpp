@@ -298,11 +298,23 @@ fznso::Status MipSolver::run(const fznso::Model& model, fznso::SolutionSink& sol
 	// objective means starting again whatever the layers say.
 	std::string_view objective_ident = model.objective_ident();
 	fznso::Value objective_value = model.objective_arg();
-	bool objective_is_decision = objective_value.kind() == FznsoValueDecision;
-	std::size_t objective_arg = objective_is_decision ? objective_value.as_decision().index : 0;
-	bool objective_same = built_objective_ == objective_ident &&
-	                      built_objective_is_decision_ == objective_is_decision &&
-	                      built_objective_arg_ == objective_arg;
+	// Which decisions the objective names, in order. A list for a lexicographic
+	// objective and one entry for a scalar one, so two objectives of the same
+	// kind over different decisions — or the same ones ranked differently —
+	// compare unequal, which is what sends the build back to the start.
+	std::vector<std::size_t> objective_args;
+	if (objective_value.kind() == FznsoValueDecision) {
+		objective_args.push_back(objective_value.as_decision().index);
+	} else if (!objective_ident.empty() && objective_value.kind() == FznsoValueList) {
+		for (std::size_t i = 0; i < objective_value.size(); i++) {
+			fznso::Value entry = objective_value[i];
+			if (entry.kind() == FznsoValueDecision) {
+				objective_args.push_back(entry.as_decision().index);
+			}
+		}
+	}
+	bool objective_same =
+		built_objective_ == objective_ident && built_objective_args_ == objective_args;
 
 	std::size_t keep = std::min(model.layer_unchanged(), built_layers_);
 	if (!backend_->capabilities().incremental || !objective_same || keep == 0 ||
@@ -354,8 +366,7 @@ fznso::Status MipSolver::run(const fznso::Model& model, fznso::SolutionSink& sol
 	}
 	built_layers_ = layers;
 	built_objective_ = std::string{objective_ident};
-	built_objective_is_decision_ = objective_is_decision;
-	built_objective_arg_ = objective_arg;
+	built_objective_args_ = objective_args;
 	if (layer_end_.size() != layers) {
 		// The fallback above rebuilt everything in one go, so there are no
 		// per-layer ends to truncate to next time.
@@ -370,7 +381,9 @@ fznso::Status MipSolver::run(const fznso::Model& model, fznso::SolutionSink& sol
 
 	std::string_view objective = model.objective_ident();
 	have_objective_ = !objective.empty();
-	float_objective_ = objective == "float_minimize" || objective == "float_maximize";
+	float_objective_ =
+		objective == "float_minimize" || objective == "float_maximize" ||
+		objective == "float_lex_minimize" || objective == "float_lex_maximize";
 	have_bound_ = false;
 
 	// Which decisions need a value, resolved once rather than per solution.

@@ -15,6 +15,10 @@ include "fzn_bool_lin_eq.mzn";
 include "fzn_bool_lin_le.mzn";
 include "fzn_bool_to_int.mzn";
 include "mip_domains.mzn";
+include "fzn_int_lin_le_imp.mzn";
+include "fzn_int_lin_eq_imp.mzn";
+include "fzn_float_lin_le_imp.mzn";
+include "fzn_float_lin_eq_imp.mzn";
 % Nothing here calls it, but `mip_select` states itself with `fzn_bool_lin_eq`
 % and MiniZinc only reifies a call whose reified form is declared.
 include "fzn_bool_lin_eq_reif.mzn";
@@ -63,31 +67,21 @@ function float: mip_float_lin_lb(array [int] of float: coeffs, array [int] of va
     float: hi = mip_float_lin_ub([-c | c in coeffs], xs);
   } in if hi = infinity then -infinity else -hi endif;
 
-/** @group mip `b -> sum(coeffs .* xs) <= bound`, as one big-M row. */
-predicate fzn_int_lin_le_imp(
-  list of int: coeffs,
-  list of var int: xs,
-  int: bound,
-  var bool: b,
-) =
-  let {
-    int: hi = mip_int_lin_ub(coeffs, xs);
-  } in if is_fixed(b) then
-    if fix(b) then fzn_int_lin_le(coeffs, xs, bound) else true endif
-  elseif hi <= bound then
-    true % The row holds whatever `b` is.
-  elseif mip_int_lin_lb(coeffs, xs) > bound then
-    not b % It can never hold.
-  else
-    assert(
-      hi < infinity,
-      "This model needs a finite upper bound on `\(coeffs) . \(xs)` for a big-M " ++
-        "constraint, but at least one variable in it is unbounded. Give the " ++
-        "variables in the model finite domains.",
-    ) /\
-      % At `b = 1` this is the row itself; at `b = 0` the bound implies it.
-      fzn_int_lin_le(coeffs ++ [hi - bound], xs ++ [bool2int(b)], hi)
-  endif;
+% `c = a * b` with one operand a value, which makes it linear. These are
+% overloads of `fzn_float_times`, not branches inside it: the all-variable form
+% is the solver's — `fznso_constraints/fzn_float_times.mzn` declares it, and a
+% backend declaring `float_times` replaces that declaration.
+%
+% Written as the equation rather than a hand-built `fzn_float_lin_eq`, which is
+% the one exception to this file's rule: the rule exists because the natural
+% form of a *linear* body flattens back to the predicate stating it, and the
+% natural form of this one is `float_lin_eq`, a different constraint. Stating it
+% leaves the flattener free to fold the product into a surrounding linear
+% expression, share it through CSE and propagate its bounds.
+
+predicate fzn_float_times(float: a, var float: b, var float: c) = c = a * b;
+
+predicate fzn_float_times(var float: a, float: b, var float: c) = c = a * b;
 
 /** @group mip `not b -> sum(coeffs .* xs) <= bound`, as one big-M row.
  *
@@ -121,24 +115,6 @@ predicate fzn_int_lin_le_imp_not(
       fzn_int_lin_le(coeffs ++ [-(hi - bound)], xs ++ [bool2int(b)], bound)
   endif;
 
-/** @group mip `b -> sum(coeffs .* xs) = total`, as the two inequalities.
- *
- * A decided indicator first: an equality the backend takes in one row would
- * otherwise reach it as the two inequalities its `_imp` form is made of.
- */
-predicate fzn_int_lin_eq_imp(
-  list of int: coeffs,
-  list of var int: xs,
-  int: total,
-  var bool: b,
-) =
-  if is_fixed(b) then
-    if fix(b) then fzn_int_lin_eq(coeffs, xs, total) else true endif
-  else
-    fzn_int_lin_le_imp(coeffs, xs, total, b) /\
-      fzn_int_lin_le_imp([-c | c in coeffs], xs, -total, b)
-  endif;
-
 /** @group mip `not b -> sum(coeffs .* xs) = total`, as the two inequalities. */
 predicate fzn_int_lin_eq_imp_not(
   list of int: coeffs,
@@ -151,35 +127,6 @@ predicate fzn_int_lin_eq_imp_not(
   else
     fzn_int_lin_le_imp_not(coeffs, xs, total, b) /\
       fzn_int_lin_le_imp_not([-c | c in coeffs], xs, -total, b)
-  endif;
-
-/** @group mip `b -> sum(coeffs .* xs) <= bound` over floats. */
-predicate fzn_float_lin_le_imp(
-  list of float: coeffs,
-  list of var float: xs,
-  float: bound,
-  var bool: b,
-) =
-  let {
-    float: hi = mip_float_lin_ub(coeffs, xs);
-  } in if is_fixed(b) then
-    if fix(b) then fzn_float_lin_le(coeffs, xs, bound) else true endif
-  elseif hi <= bound then
-    true
-  elseif mip_float_lin_lb(coeffs, xs) > bound then
-    not b % It can never hold.
-  else
-    assert(
-      hi < infinity,
-      "This model needs a finite upper bound on `\(coeffs) . \(xs)` for a big-M " ++
-        "constraint, but at least one variable in it is unbounded. Give the " ++
-        "variables in the model finite domains.",
-    ) /\
-      fzn_float_lin_le(
-        coeffs ++ [hi - bound],
-        xs ++ [int2float(bool2int(b))],
-        hi,
-      )
   endif;
 
 /** @group mip `not b -> sum(coeffs .* xs) <= bound` over floats. */
@@ -230,20 +177,6 @@ predicate fzn_float_lin_lt_imp(
   float: bound,
   var bool: b,
 ) = fzn_float_lin_le_imp(coeffs, xs, bound - MIP_float_epsilon, b);
-
-/** @group mip `b -> sum(coeffs .* xs) = total` over floats. */
-predicate fzn_float_lin_eq_imp(
-  list of float: coeffs,
-  list of var float: xs,
-  float: total,
-  var bool: b,
-) =
-  if is_fixed(b) then
-    if fix(b) then fzn_float_lin_eq(coeffs, xs, total) else true endif
-  else
-    fzn_float_lin_le_imp(coeffs, xs, total, b) /\
-      fzn_float_lin_le_imp([-c | c in coeffs], xs, -total, b)
-  endif;
 
 /** @group mip `not b -> sum(coeffs .* xs) = total` over floats. */
 predicate fzn_float_lin_eq_imp_not(

@@ -1,8 +1,12 @@
 % A product of two variables is not linear, so this is `linear/`'s cascade of
 % special cases in registry spelling, ending in one row per value of the
 % narrower operand.
+%
+% As in `fzn_float_times.mzn`, there is no branch for a backend that has
+% quadratic rows: declaring `int_times` replaces this body, and naming
+% `int_times` here would only come back to this predicate through the rewrite
+% layer.
 
-include "options.mzn";
 include "mip_linear.mzn";
 include "mip_element.mzn";
 include "fzn_int_pow.mzn";
@@ -19,23 +23,14 @@ predicate fzn_int_times(var int: a, var int: b, var int: c) =
     fzn_int_lin_le([1, 1, -1], [a, b, c], 1) /\
       fzn_int_lin_le([-1, 1], [a, c], 0) /\
       fzn_int_lin_le([-1, 1], [b, c], 0)
-  elseif MIP_quadratic_int_card < infinity /\
-    min(card(dom(a)), card(dom(b))) >= MIP_quadratic_int_card then
-    % The FlatZinc builtin, *not* this predicate: a backend declaring
-    % `int_times` has that rewrite dropped, so the call reaches the solver. One
-    % that does not would loop straight back here — hence the `infinity`
-    % default, which only such a backend lowers.
-    int_times(a, b, c)
   elseif not (has_bounds(a) /\ has_bounds(b)) then
-    % Every remaining formulation enumerates a domain. Tested after the native
-    % branch, because an unbounded domain has cardinality `infinity` and would
-    % otherwise take it on a backend with no product.
+    % Every remaining formulation enumerates a domain, so an unbounded one has
+    % none to offer.
     abort(
       "Unable to create a linear formulation of `int_times(\(a), \(b), \(c))`.\n" ++
         "\tA product of two variables is linear only over finite domains, and at\n" ++
         "\tleast one of these has none. Give the variables in the model finite\n" ++
-        "\tdomains, or pass `-D QuadrInt=true` if the selected solver has\n" ++
-        "\tquadratic constraints.",
+        "\tdomains, or use a solver that declares `int_times`.",
     )
   else
     % The narrower operand indexes: one row per value of it, against its own

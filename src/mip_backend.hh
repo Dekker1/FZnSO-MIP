@@ -94,6 +94,11 @@ struct Capabilities {
 	/// been solved, which is what lets a run keep whatever an unchanged prefix
 	/// of layers built and post only what lies above it.
 	bool incremental = false;
+	/// Several objectives optimised in priority order, so the `_lex_`
+	/// objectives are declared rather than left to the consumer to encode as a
+	/// weighted sum — which needs weights wide enough to separate the levels
+	/// and loses the guarantee when they are not.
+	bool lexicographic = false;
 };
 
 /// Everything one solve produced, apart from the solutions already streamed.
@@ -158,8 +163,22 @@ public:
 	virtual void add_indicator_row(int bin_col, bool on_value, std::size_t nnz, const int* idx,
 	                               const double* val, RowSense sense, double rhs);
 
-	/// `x[out_col] = x[a_col] · x[b_col]`.
-	virtual void add_quadratic_row(int out_col, int a_col, int b_col);
+	/// Optimise `x[cols[0]]`, then `x[cols[1]]` subject to it, and so on.
+	///
+	/// Replaces the column costs a scalar objective is built from: several
+	/// objectives in priority order are a property of the model, not of one
+	/// column, so `set_objective_sense` says nothing here and every cost stays
+	/// zero. Called once, after the columns exist. Reached only when
+	/// `Capabilities::lexicographic` is set.
+	virtual void set_lex_objective(std::size_t n, const int* cols, bool maximise);
+
+	/// `x[a_col] · x[b_col] − x[out_col] = rhs`.
+	///
+	/// `out_col` is negative when the product is against a value rather than a
+	/// column — `x·y = 5` names no third decision — and there is then no linear
+	/// term to subtract. Both operands are always columns: with either one
+	/// fixed the product is linear and never reaches here.
+	virtual void add_quadratic_row(int out_col, int a_col, int b_col, double rhs);
 
 	// --- incremental --------------------------------------------------------
 
