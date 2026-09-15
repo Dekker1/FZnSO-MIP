@@ -203,6 +203,110 @@ void aliasing(fznso::Library& lib) {
 	check(solver.statistic("constraints").as_int() == 1, "aliasing model builds one row");
 }
 
+/// A `LayeredModel` whose absent domains answer `kind` and nothing else.
+///
+/// The C++ absent value happens to answer `len` with 0, which hides a solver
+/// reading `size()` before `kind()`; the Rust binding's absent value aborts
+/// instead. This hands every solver the stricter of the two.
+class StrictAbsentModel final : public fznso::Model {
+public:
+	explicit StrictAbsentModel(const LayeredModel& inner) : inner_(inner) {}
+
+	std::size_t layer_count() const override { return inner_.layer_count(); }
+	std::size_t layer_permanent() const override { return inner_.layer_permanent(); }
+	std::size_t layer_unchanged() const override { return inner_.layer_unchanged(); }
+	std::size_t layer_redundant_count() const override { return inner_.layer_redundant_count(); }
+	std::size_t layer_redundant_index(std::size_t n) const override {
+		return inner_.layer_redundant_index(n);
+	}
+	std::size_t decision_count() const override { return inner_.decision_count(); }
+	std::size_t decision_layer_end(std::size_t l) const override {
+		return inner_.decision_layer_end(l);
+	}
+	FznsoType decision_type(Decision d) const override { return inner_.decision_type(d); }
+	fznso::Value decision_domain(Decision d) const override {
+		fznso::Value v = inner_.decision_domain(d);
+		if (v.kind() != FznsoValueAbsent) {
+			return v;
+		}
+		static const FznsoValueMethods table = [] {
+			FznsoValueMethods m = fznso::detail::default_value_methods();
+			m.len = [](const FznsoValue*) -> std::size_t { fznso::detail::value_slot_misuse("len"); };
+			return m;
+		}();
+		return fznso::Value{FznsoValueRef{nullptr, &table}};
+	}
+	std::optional<std::string_view> decision_name(Decision d) const override {
+		return inner_.decision_name(d);
+	}
+	bool decision_defined(Decision d) const override { return inner_.decision_defined(d); }
+	bool decision_in_solution(Decision d) const override { return inner_.decision_in_solution(d); }
+	std::size_t decision_annotation_count(Decision d) const override {
+		return inner_.decision_annotation_count(d);
+	}
+	fznso::AnnotationRef decision_annotation(Decision d, std::size_t i) const override {
+		return inner_.decision_annotation(d, i);
+	}
+	std::size_t constraint_count() const override { return inner_.constraint_count(); }
+	std::size_t constraint_layer_end(std::size_t l) const override {
+		return inner_.constraint_layer_end(l);
+	}
+	std::string_view constraint_ident(fznso::Constraint c) const override {
+		return inner_.constraint_ident(c);
+	}
+	std::size_t constraint_argument_count(fznso::Constraint c) const override {
+		return inner_.constraint_argument_count(c);
+	}
+	fznso::Value constraint_argument(fznso::Constraint c, std::size_t i) const override {
+		return inner_.constraint_argument(c, i);
+	}
+	std::optional<Decision> constraint_defines(fznso::Constraint c) const override {
+		return inner_.constraint_defines(c);
+	}
+	std::size_t constraint_annotation_count(fznso::Constraint c) const override {
+		return inner_.constraint_annotation_count(c);
+	}
+	fznso::AnnotationRef constraint_annotation(fznso::Constraint c, std::size_t i) const override {
+		return inner_.constraint_annotation(c, i);
+	}
+	std::string_view objective_ident() const override { return inner_.objective_ident(); }
+	fznso::Value objective_arg() const override { return inner_.objective_arg(); }
+	std::size_t objective_annotation_count() const override {
+		return inner_.objective_annotation_count();
+	}
+	fznso::AnnotationRef objective_annotation(std::size_t i) const override {
+		return inner_.objective_annotation(i);
+	}
+
+private:
+	const LayeredModel& inner_;
+};
+
+/// A `var bool` with an absent domain, channelled through `bool_to_int` into a
+/// linear row, as `LayeredModel` in Rust hands it over.
+///
+/// The domain may be read for its kind only: reading its `len` aborted the
+/// process on the first `var bool` of a flattened MiniZinc model.
+void absent_bool_domain(fznso::Library& lib) {
+	LayeredModel m;
+	Decision b = m.add_decision(BOOL, OwnedValue{}, "b");
+	Decision i = m.add_decision(INT, OwnedValue::int_range(0, 5), "i");
+	m.add_constraint("bool_to_int", {OwnedValue{b}, OwnedValue{i}});
+	lin_le(m, {-1}, {OwnedValue{i}}, -1); // i >= 1
+	m.set_objective("int_maximize", OwnedValue{i});
+
+	StrictAbsentModel strict{m};
+	fznso::DynSolver solver = lib.create_solver();
+	std::vector<std::pair<bool, std::int64_t>> solutions;
+	Status status = solver.run(strict, [&](const Solution& s) {
+		solutions.emplace_back(s[b].kind() == FznsoValueBool && s[b].as_bool(), s[i].as_int());
+	});
+	check(status.complete(), "absent bool domain model completes");
+	// The Boolean caps the shared column at 1, whatever the integer's domain says.
+	check(!solutions.empty() && solutions.back().first && solutions.back().second == 1,
+	      "absent bool domain model solves to b=true, i=1");
+}
+
 /// A domain with a hole is respected, not flattened to its bounds.
 ///
 /// A MIP column is an interval, so `var {1, 9}` needs saying in rows. Reading
@@ -710,6 +814,7 @@ int main(int argc, char** argv) {
 		bool_model(lib);
 		bool_lin_model(lib);
 		aliasing(lib);
+		absent_bool_domain(lib);
 		domain_with_holes(lib);
 		float_model(lib);
 		unsat_model(lib);

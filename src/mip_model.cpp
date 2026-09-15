@@ -15,24 +15,30 @@ using Interval = MipModel::Interval;
 /// A set value is already a range list, which is exactly this shape. An absent
 /// domain is one interval — the caller passes what the *type* implies, since a
 /// `var bool` with no domain is still `[0, 1]`.
+///
+/// `size()` is read only once the kind says it is a set: an absent value need
+/// not answer `len` at all, and the Rust binding's does not.
 std::vector<Interval> intervals_of(const fznso::Value& domain, Interval fallback) {
-	std::size_t n = domain.size();
 	std::vector<Interval> out;
 	switch (domain.kind()) {
-	case FznsoValueSetInt:
+	case FznsoValueSetInt: {
+		std::size_t n = domain.size();
 		out.reserve(n);
 		for (std::size_t i = 0; i < n; i++) {
 			fznso::Range<std::int64_t> r = domain.int_range(i);
 			out.push_back(Interval{static_cast<double>(r.min), static_cast<double>(r.max)});
 		}
 		break;
-	case FznsoValueSetFloat:
+	}
+	case FznsoValueSetFloat: {
+		std::size_t n = domain.size();
 		out.reserve(n);
 		for (std::size_t i = 0; i < n; i++) {
 			fznso::Range<double> r = domain.float_range(i);
 			out.push_back(Interval{r.min, r.max});
 		}
 		break;
+	}
 	default:
 		out.push_back(fallback);
 		break;
@@ -359,7 +365,7 @@ std::string MipModel::build(const fznso::Model& model, MipBackend& backend,
 			// A fixed entry contributes nothing to the ranking — every
 			// assignment scores the same on it — so it is dropped rather than
 			// given a column of its own.
-			std::size_t n = arg.size();
+			std::size_t n = arg.kind() == FznsoValueList ? arg.size() : 0;
 			lex_cols.reserve(n);
 			for (std::size_t i = 0; i < n; i++) {
 				fznso::Value entry = arg[i];
