@@ -618,6 +618,69 @@ void incremental_shapes(fznso::Library& lib) {
 	}
 }
 
+/// Retracting a layer from a model that has indicator rows.
+///
+/// A backend may keep indicator rows apart from linear ones — Gurobi does — so a
+/// layer boundary counted over both is not an index into either. Two shapes:
+/// the indicator below the retracted layer, where a pop left the layer's linear
+/// row behind, and the indicator inside it, where a pop left the indicator
+/// behind. Either way the next layer sees a constraint that is no longer in the
+/// model. Skipped where `int_lin_le_imp` is not declared.
+void retract_with_indicators(fznso::Library& lib) {
+	FznsoConstraintList declared = lib.constraint_types();
+	bool indicators = false;
+	for (std::size_t i = 0; i < declared.len; i++) {
+		std::string ident{declared.constraints[i].ident.ptr, declared.constraints[i].ident.len};
+		indicators = indicators || ident == "int_lin_le_imp";
+	}
+	if (!indicators) {
+		return;
+	}
+	for (bool in_layer : {false, true}) {
+		LayeredModel m;
+		Decision x = m.add_decision(INT, OwnedValue::int_range(0, 10), "x");
+		Decision b = m.add_decision(BOOL, OwnedValue{}, "b");
+		auto imp = [&](std::int64_t bound) { // b -> x <= bound
+			m.add_constraint("int_lin_le_imp",
+			                 {list({num(1)}), list({OwnedValue{x}}), num(bound), OwnedValue{b}});
+		};
+		if (in_layer) {
+			m.add_constraint("bool_clause", {list({OwnedValue{b}}), list({})}); // b
+		} else {
+			imp(5);
+		}
+
+		fznso::DynSolver solver = lib.create_solver();
+		solver.option_set("all_solutions", fznso::Value{true});
+		Status s1 = solver.run(m, [](const Solution&) {});
+		check(s1.complete(), "the base layer completes");
+
+		m.push_layer();
+		if (in_layer) {
+			imp(3);
+		} else {
+			lin_le(m, {1}, {OwnedValue{x}}, 3); // x <= 3
+		}
+		m.set_unchanged(1);
+		Status s2 = solver.run(m, [](const Solution&) {});
+		check(s2.complete(), "the first pushed layer completes");
+		m.pop_layer();
+
+		m.push_layer();
+		lin_le(m, {-1}, {OwnedValue{x}}, -7); // x >= 7
+		m.set_unchanged(1);
+		std::set<std::int64_t> xs;
+		std::size_t count = 0;
+		Status s3 = solver.run(m, [&](const Solution& s) {
+			xs.insert(s[x].as_int());
+			count++;
+		});
+		const char* what = in_layer ? "a retracted indicator is gone from the model"
+		                            : "a row retracted above an indicator is gone from the model";
+		check(s3.complete() && count == 4 && xs == std::set<std::int64_t>{7, 8, 9, 10}, what);
+	}
+}
+
 /// `x · y = 6` with `x <= 2`, for a backend that declares `int_times`.
 ///
 /// The product of two decisions against a *value*: there is no third decision
@@ -828,6 +891,7 @@ int main(int argc, char** argv) {
 		statistics(lib);
 		incremental_rerun(lib);
 		incremental_shapes(lib);
+		retract_with_indicators(lib);
 	} catch (const std::exception& e) {
 		std::fprintf(stderr, "FAIL: %s\n", e.what());
 		return 1;

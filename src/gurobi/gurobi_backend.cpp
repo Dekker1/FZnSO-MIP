@@ -14,6 +14,7 @@
 // attempted at the first of those to need it, and whatever went wrong is kept
 // and returned from both.
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -116,6 +117,8 @@ struct Symbols {
 	                              char sense, double rhs, const char* name) = nullptr;
 	int(__stdcall* GRBdelvars)(GRBmodel* model, int numdel, const int* ind) = nullptr;
 	int(__stdcall* GRBdelconstrs)(GRBmodel* model, int numdel, const int* ind) = nullptr;
+	int(__stdcall* GRBdelgenconstrs)(GRBmodel* model, int numdel, const int* ind) = nullptr;
+	int(__stdcall* GRBdelqconstrs)(GRBmodel* model, int numdel, const int* ind) = nullptr;
 
 	int(__stdcall* GRBgetintattr)(GRBmodel* model, const char* name, int* value) = nullptr;
 	int(__stdcall* GRBsetintattr)(GRBmodel* model, const char* name, int value) = nullptr;
@@ -262,6 +265,7 @@ public:
 			call(fn_.GRBfreemodel(model_), "unable to discard the model");
 			model_ = nullptr;
 		}
+		row_kind_.clear();
 		new_model();
 	}
 
@@ -294,6 +298,7 @@ public:
 		call(fn_.GRBaddconstr(model_, static_cast<int>(nnz), idx, val, grb_sense(sense), rhs,
 		                      nullptr),
 		     "unable to add a row");
+		row_kind_.push_back(kLinear);
 	}
 
 	void add_indicator_row(int bin_col, bool on_value, std::size_t nnz, const int* idx,
@@ -304,6 +309,7 @@ public:
 		call(fn_.GRBaddgenconstrIndicator(model_, nullptr, bin_col, on_value ? 1 : 0,
 		                                  static_cast<int>(nnz), idx, val, grb_sense(sense), rhs),
 		     "unable to add an indicator row");
+		row_kind_.push_back(kIndicator);
 	}
 
 	void add_quadratic_row(int out_col, int a_col, int b_col, double rhs) override {
@@ -317,6 +323,7 @@ public:
 		call(fn_.GRBaddqconstr(model_, out_col >= 0 ? 1 : 0, &out_col, &linear, 1, &a_col, &b_col,
 		                       &product, kEqual, rhs, nullptr),
 		     "unable to add a quadratic row");
+		row_kind_.push_back(kQuadratic);
 	}
 
 	void set_lex_objective(std::size_t n, const int* cols, bool maximise) override {
@@ -354,8 +361,26 @@ public:
 		// Rows added since the last update are not counted yet, so the model
 		// has to be made current before either count is believed.
 		call(fn_.GRBupdatemodel(model_), "unable to update the model");
-		drop(first_row, "NumConstrs", fn_.GRBdelconstrs, "unable to delete rows");
-		drop(first_col, "NumVars", fn_.GRBdelvars, "unable to delete columns");
+		// The core numbers every row in one sequence, but Gurobi keeps linear,
+		// indicator and quadratic constraints in three, so `first_row` indexes
+		// none of them. Each sequence loses as many rows as the doomed suffix
+		// holds of its kind, and loses them from its own end.
+		std::size_t doomed[3] = {0, 0, 0};
+		for (std::size_t r = first_row; r < row_kind_.size(); r++) {
+			doomed[row_kind_[r]]++;
+		}
+		row_kind_.resize(std::min(first_row, row_kind_.size()));
+		drop_last(doomed[kLinear], "NumConstrs", fn_.GRBdelconstrs, "unable to delete rows");
+		drop_last(doomed[kIndicator], "NumGenConstrs", fn_.GRBdelgenconstrs,
+		          "unable to delete indicator rows");
+		drop_last(doomed[kQuadratic], "NumQConstrs", fn_.GRBdelqconstrs,
+		          "unable to delete quadratic rows");
+		int columns = 0;
+		call(fn_.GRBgetintattr(model_, "NumVars", &columns), "unable to delete columns");
+		if (static_cast<std::size_t>(columns) > first_col) {
+			drop_last(static_cast<std::size_t>(columns) - first_col, "NumVars", fn_.GRBdelvars,
+			          "unable to delete columns");
+		}
 		// And again, because the deletions are pending too and everything
 		// posted after this counts on the indices they leave behind.
 		call(fn_.GRBupdatemodel(model_), "unable to update the model");
@@ -486,17 +511,18 @@ private:
 		     "unable to create a model");
 	}
 
-	/// Delete everything from `first` on, given the attribute that counts them
-	/// and the call that removes them.
-	void drop(std::size_t first, const char* count_attr,
-	          int(__stdcall* remove)(GRBmodel*, int, const int*), const char* what) {
-		int count = 0;
-		call(fn_.GRBgetintattr(model_, count_attr, &count), what);
-		if (static_cast<std::size_t>(count) <= first) {
+	/// Delete the last `n`, given the attribute that counts them and the call
+	/// that removes them.
+	void drop_last(std::size_t n, const char* count_attr,
+	               int(__stdcall* remove)(GRBmodel*, int, const int*), const char* what) {
+		if (n == 0) {
 			return;
 		}
-		std::vector<int> doomed(static_cast<std::size_t>(count) - first);
-		std::iota(doomed.begin(), doomed.end(), static_cast<int>(first));
+		int count = 0;
+		call(fn_.GRBgetintattr(model_, count_attr, &count), what);
+		auto have = static_cast<std::size_t>(count);
+		std::vector<int> doomed(std::min(n, have));
+		std::iota(doomed.begin(), doomed.end(), static_cast<int>(have - doomed.size()));
 		call(remove(model_, static_cast<int>(doomed.size()), doomed.data()), what);
 	}
 
@@ -529,6 +555,11 @@ private:
 	void* dll_ = nullptr;
 	GRBenv* env_ = nullptr;
 	GRBmodel* model_ = nullptr;
+
+	/// Which of Gurobi's constraint sequences each of the core's rows went to,
+	/// by the core's row number; see `truncate`.
+	enum RowKind : std::uint8_t { kLinear, kIndicator, kQuadratic };
+	std::vector<std::uint8_t> row_kind_;
 
 	/// Whether a load has been attempted, and what it said if it failed. A
 	/// second attempt is only made after `gurobi_dll` changes, because the
@@ -607,6 +638,8 @@ bool GurobiBackend::available() {
 	GRB_RESOLVE(GRBaddqconstr);
 	GRB_RESOLVE(GRBdelvars);
 	GRB_RESOLVE(GRBdelconstrs);
+	GRB_RESOLVE(GRBdelgenconstrs);
+	GRB_RESOLVE(GRBdelqconstrs);
 	GRB_RESOLVE(GRBgetintattr);
 	GRB_RESOLVE(GRBsetintattr);
 	GRB_RESOLVE(GRBgetdblattr);
