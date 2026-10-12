@@ -17,7 +17,8 @@ predicate fzn_float_if_then_else(
   else
     let {
       array [int] of var bool: chosen = mip_first_true(conditions);
-    } in if forall (i in index_set(values)) (is_fixed(values[i])) then
+    } in if mip_choice_is_total(conditions) /\
+      forall (i in index_set(values)) (is_fixed(values[i])) then
       fzn_float_lin_eq(
         [fix(values[i]) | i in index_set(values)] ++ [-1.0],
         [int2float(bool2int(chosen[i])) | i in index_set(chosen)] ++ [result],

@@ -123,7 +123,8 @@ predicate mip_float_element(
         index_set(xs),
         [mip_select_at(index, i + offset - 1) | i in index_set(xs)],
       );
-  } in if forall (i in index_set(at)) (is_fixed(xs[i])) then
+  } in fzn_int_in(index, {i + offset - 1 | i in index_set(xs)}) /\
+    if forall (i in index_set(at)) (is_fixed(xs[i])) then
     % The `bool2int` and `int2float` cost no columns: both are total functions
     % between two decisions, which the backend holds as one.
     fzn_float_lin_eq(
@@ -147,24 +148,30 @@ predicate mip_bool_element(list of var bool: xs, int: offset, var int: index, va
     set of int: live = {i | i in index_set(at) where not is_fixed(at[i]) \/ fix(at[i])};
     set of int: yes = {i | i in live where is_fixed(xs[i]) /\ fix(xs[i])};
     set of int: no = {i | i in live where is_fixed(xs[i]) /\ not fix(xs[i])};
-  } in if live = yes union no then
-    % Every element is a constant, so the result holds exactly when the selected
-    % position is one of the true ones: one reified clause rather than two
-    % clauses per position.
-    fzn_bool_clause_reif([at[i] | i in yes], [], value)
+  } in if card(live) = 0 then
+    % No position can be selected, so there is nothing for `index` to name.
+    false
   else
-    % A constant element does not need its own pair of clauses either. At most
-    % one selector is true, so one row over all the `true` elements says "if the
-    % selected element is one of these, so is `value`", and one over the `false`
-    % ones says the converse — two rows for the whole constant part, however
-    % much of the array it is.
-    mip_bool_element_selected(yes, at, value, 0) /\
-      mip_bool_element_selected(no, at, value, 1) /\
-      forall (i in live diff (yes union no)) (
-        % `at[i] -> (value <-> xs[i])`, as the two clauses it is.
-        fzn_bool_clause([value], [at[i], xs[i]]) /\
-          fzn_bool_clause([xs[i]], [at[i], value])
-      )
+    fzn_int_in(index, {i + offset - 1 | i in live}) /\
+      if live = yes union no then
+        % Every element is a constant, so the result holds exactly when the
+        % selected position is one of the true ones: one reified clause rather
+        % than two clauses per position.
+        fzn_bool_clause_reif([at[i] | i in yes], [], value)
+      else
+        % A constant element does not need its own pair of clauses either. At
+        % most one selector is true, so one row over all the `true` elements
+        % says "if the selected element is one of these, so is `value`", and one
+        % over the `false` ones says the converse — two rows for the whole
+        % constant part, however much of the array it is.
+        mip_bool_element_selected(yes, at, value, 0) /\
+          mip_bool_element_selected(no, at, value, 1) /\
+          forall (i in live diff (yes union no)) (
+            % `at[i] -> (value <-> xs[i])`, as the two clauses it is.
+            fzn_bool_clause([value], [at[i], xs[i]]) /\
+              fzn_bool_clause([xs[i]], [at[i], value])
+          )
+      endif
   endif;
 
 /** @group mip `at[i] for i in sel` forces `value` to `1 - polarity`.
@@ -181,10 +188,16 @@ predicate mip_bool_element_selected(
   if card(sel) = 0 then
     true
   elseif card(sel) = 1 then
-    fzn_bool_clause(
-      [if polarity = 0 then value else at[min(sel)] endif],
-      [if polarity = 0 then at[min(sel)] else value endif],
-    )
+    % One position, so the implication is a clause rather than a row. Against
+    % the `false` elements it says the selector and `value` cannot both hold,
+    % which negates both literals: swapping the two sides of the `true` form
+    % states the converse instead, and lets `value` hold where the selected
+    % element is false.
+    if polarity = 0 then
+      fzn_bool_clause([value], [at[min(sel)]])
+    else
+      fzn_bool_clause([], [at[min(sel)], value])
+    endif
   else
     fzn_bool_lin_le(
       [1 | i in sel] ++ [if polarity = 0 then -1 else 1 endif],
@@ -207,6 +220,10 @@ function var int: mip_position_nd(
     int: d = length(indices);
     array [1..d] of int: stride = [product (e in i + 1..d) (sizes[e]) | i in 1..d];
     var 1..size: position;
+    constraint
+      forall (i in 1..d) (
+        fzn_int_in(indices[i], offsets[i]..offsets[i] + sizes[i] - 1)
+      );
     constraint
       fzn_int_lin_eq(
         [1] ++ [-stride[i] | i in 1..d],
